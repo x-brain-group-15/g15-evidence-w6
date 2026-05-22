@@ -561,7 +561,7 @@ aws sns publish \
   --region ap-southeast-1
 ```
 
-_(Screenshot before/after: EC2 instances → terminated sau khi Lambda chạy)_
+_(EC2 instances → terminated sau khi Lambda chạy)_
 
 ![Terminate ASG Instance](./images/terminate-instance.png)
 
