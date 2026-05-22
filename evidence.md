@@ -111,9 +111,230 @@ CloudTrail Evidence ✅
 
 > **Nguyên tắc Least-Privilege:** Role chỉ được cấp đúng 3 nhóm quyền cần thiết: scale ASG, stop RDS, ghi CloudWatch Logs. Không có quyền `ec2:*`, `iam:*`, hay bất kỳ quyền nào khác.
 
+![Architecture](./images/cost-guard-1.png)
+
+Code mẫu của Lambda:
+```python
+import boto3
+import json
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+autoscaling = boto3.client("autoscaling")
+rds         = boto3.client("rds")
+
+
+# ─────────────────────────────────────────────
+# Helper: kiểm tra tag keep=true
+# ─────────────────────────────────────────────
+def has_keep_tag(tags: list) -> bool:
+    """Trả về True nếu resource có tag keep=true (không phân biệt hoa thường)."""
+    for tag in tags or []:
+        if tag.get("Key", "").lower() == "keep" and tag.get("Value", "").lower() == "true":
+            return True
+    return False
+
+
+# ─────────────────────────────────────────────
+# ASG: Scale về 0
+# ─────────────────────────────────────────────
+def scale_down_asg() -> list:
+    """
+    Lấy danh sách tất cả ASG, scale về MinSize=0, DesiredCapacity=0
+    cho những ASG không có tag keep=true.
+
+    Flow:
+      Lambda scale ASG → 0
+      → ASG tự terminate EC2 instances
+      → CloudTrail ghi nhận TerminateInstances
+      → Cost giảm thật sự ✅
+    """
+    scaled = []
+
+    response = autoscaling.describe_auto_scaling_groups()
+
+    for group in response.get("AutoScalingGroups", []):
+        asg_name    = group["AutoScalingGroupName"]
+        min_size    = group["MinSize"]
+        desired     = group["DesiredCapacity"]
+        tags        = group.get("Tags", [])
+
+        # Chuyển tag format của ASG → cùng format với has_keep_tag
+        asg_tags = [{"Key": t["Key"], "Value": t["Value"]} for t in tags]
+
+        if has_keep_tag(asg_tags):
+            logger.info(f"[ASG] SKIP {asg_name} — tag keep=true")
+            continue
+
+        if desired == 0 and min_size == 0:
+            logger.info(f"[ASG] SKIP {asg_name} — already at 0")
+            continue
+
+        logger.info(
+            f"[ASG] SCALING DOWN {asg_name} "
+            f"(MinSize: {min_size}→0, Desired: {desired}→0)"
+        )
+
+        try:
+            autoscaling.update_auto_scaling_group(
+                AutoScalingGroupName=asg_name,
+                MinSize=0,
+                DesiredCapacity=0,
+            )
+            scaled.append({
+                "asg_name":    asg_name,
+                "prev_min":    min_size,
+                "prev_desired": desired,
+            })
+            logger.info(f"[ASG] SCALED TO 0: {asg_name} ✅")
+        except Exception as e:
+            logger.error(f"[ASG] ERROR scaling {asg_name}: {e}")
+
+    return scaled
+
+
+# ─────────────────────────────────────────────
+# DocumentDB (RDS): dừng DB instances không có keep=true
+# ─────────────────────────────────────────────
+def stop_documentdb_instances() -> list:
+    """
+    Dừng các máy chủ DocumentDB (hoặc RDS) instances đang available,
+    không có tag keep=true.
+    
+    Lưu ý kỹ thuật: DocumentDB dùng chung API với RDS của boto3.
+    """
+    stopped = []
+
+    paginator = rds.get_paginator("describe_db_instances")
+    for page in paginator.paginate():
+        for db in page.get("DBInstances", []):
+            db_id     = db["DBInstanceIdentifier"]
+            db_status = db["DBInstanceStatus"]
+            db_arn    = db["DBInstanceArn"]
+
+            if db_status != "available":
+                logger.info(f"[DocumentDB-Instance] SKIP {db_id} — status={db_status}")
+                continue
+
+            tag_response = rds.list_tags_for_resource(ResourceName=db_arn)
+            tags = tag_response.get("TagList", [])
+
+            if has_keep_tag(tags):
+                logger.info(f"[DocumentDB-Instance] SKIP {db_id} — tag keep=true")
+                continue
+
+            logger.info(f"[DocumentDB-Instance] STOPPING {db_id}")
+            try:
+                rds.stop_db_instance(DBInstanceIdentifier=db_id)
+                stopped.append(db_id)
+                logger.info(f"[DocumentDB-Instance] STOPPED {db_id} ✅")
+            except Exception as e:
+                logger.error(f"[DocumentDB-Instance] ERROR stopping {db_id}: {e}")
+
+    return stopped
+
+
+# ─────────────────────────────────────────────
+# DocumentDB Clusters: bỏ qua clusters (vì DocumentDB không hỗ trợ stop cluster)
+# ─────────────────────────────────────────────
+def check_documentdb_clusters() -> list:
+    """
+    Kiểm tra DocumentDB (hoặc RDS) clusters.
+    
+    Lưu ý: AWS DocumentDB (engine=docdb) KHÔNG hỗ trợ API stop/start cấp độ Cluster.
+    → Phải skip, nếu không sẽ lỗi InvalidParameterCombination.
+    """
+    stopped = []
+
+    paginator = rds.get_paginator("describe_db_clusters")
+    for page in paginator.paginate():
+        for cluster in page.get("DBClusters", []):
+            cluster_id     = cluster["DBClusterIdentifier"]
+            cluster_status = cluster["Status"]
+            cluster_arn    = cluster["DBClusterArn"]
+            engine         = cluster.get("Engine", "")
+
+            # ⚠️ DocumentDB cluster KHÔNG support stop — bỏ qua
+            if engine == "docdb":
+                logger.info(f"[DocumentDB-Cluster] SKIP {cluster_id} — DocumentDB cluster cannot be stopped")
+                continue
+
+            if cluster_status != "available":
+                logger.info(f"[DB-Cluster] SKIP {cluster_id} — status={cluster_status}")
+                continue
+
+            tag_response = rds.list_tags_for_resource(ResourceName=cluster_arn)
+            tags = tag_response.get("TagList", [])
+
+            if has_keep_tag(tags):
+                logger.info(f"[DB-Cluster] SKIP {cluster_id} — tag keep=true")
+                continue
+
+            logger.info(f"[DB-Cluster] STOPPING {cluster_id} (engine={engine})")
+            try:
+                rds.stop_db_cluster(DBClusterIdentifier=cluster_id)
+                stopped.append(cluster_id)
+                logger.info(f"[DB-Cluster] STOPPED {cluster_id} ✅")
+            except Exception as e:
+                logger.error(f"[DB-Cluster] ERROR stopping {cluster_id}: {e}")
+
+    return stopped
+
+
+# ─────────────────────────────────────────────
+# Lambda Handler chính
+# ─────────────────────────────────────────────
+def lambda_handler(event, context):
+    logger.info("=" * 60)
+    logger.info("w6-cost-guard invoked")
+    logger.info(f"Event: {json.dumps(event)}")
+    logger.info("=" * 60)
+
+    # Xác định nguồn kích hoạt
+    source = "scheduled"
+    if event.get("Records"):
+        sns_msg = event["Records"][0].get("Sns", {}).get("Message", "")
+        source  = "budgets-sns"
+        logger.info(f"Triggered by SNS/Budgets: {sns_msg[:200]}")
+
+    # ── Scale ASG về 0 (EC2 tự bị terminate) ──
+    logger.info("--- Step 1: Scale down Auto Scaling Groups ---")
+    scaled_asg = scale_down_asg()
+
+    # ── Dừng DocumentDB instances ──────────────
+    logger.info("--- Step 2: Stop DocumentDB Instances ---")
+    stopped_db_instances = stop_documentdb_instances()
+
+    # ── Dừng DocumentDB clusters ───────────────
+    logger.info("--- Step 3: Check DocumentDB Clusters ---")
+    stopped_clusters = check_documentdb_clusters()
+
+    # ── Tổng kết ─────────────────────────────
+    result = {
+        "source":                 source,
+        "scaled_asg":             scaled_asg,             # ASG đã scale về 0
+        "stopped_db_instances":   stopped_db_instances,   # DocumentDB/RDS instances đã dừng
+        "stopped_clusters":       stopped_clusters,       # Clusters đã dừng (thường là rỗng cho docdb)
+        "total_actions":          len(scaled_asg) + len(stopped_db_instances) + len(stopped_clusters),
+    }
+
+    logger.info("=" * 60)
+    logger.info(f"SUMMARY: {json.dumps(result, indent=2)}")
+    logger.info("=" * 60)
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(result),
+    }
+
+```
+
 ---
 
 ## Component (b) — EventBridge Scheduler (Daily Cron)
+
 
 | Thuộc tính | Giá trị |
 |-----------|---------|
