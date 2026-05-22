@@ -563,7 +563,7 @@ aws sns publish \
 
 _(Screenshot before/after: EC2 instances → terminated sau khi Lambda chạy)_
 
-> **📋 TODO:** Thêm screenshot CloudTrail `TerminateInstances` event ở đây
+![Terminate ASG Instance](./images/terminate-instance.png)
 
 ---
 
