@@ -831,6 +831,10 @@ _Hình 4: Alarm Action_
 _Hình 5: SNS Email Confirmed_
 ![SNS Email Confirmed](./images/email_sns_confirmed.png)
 
+*Hình 6: SNS Email Received*
+![SNS Email Received](./images/email-alarm.png)
+
+
 ## Log Insights
 
 Đây là query lọc ra các dòng log có tiền tố [Failure] để tổng hợp số lượng và các nguyên nhân gây ra lỗi khi gọi Invoke Lambda và dưới đây là kết quả mẫu.
